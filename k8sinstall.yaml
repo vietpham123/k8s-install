@@ -1,0 +1,130 @@
+---
+
+#This playbook is designed to build out a kubernetes cluster from a fresh install of ubuntu including all configuration files
+
+- name: Create host files for K8s nodes
+  hosts: all
+  become: yes
+  tasks:
+    - copy:
+        src: /etc/hosts
+        dest: /etc/hosts
+
+- name: Create containerd.conf file and load kernel module
+  hosts: all
+  become: yes
+  tasks:
+    - copy:
+        src: ~/ansible/k8s/containerd.conf
+        dest: /etc/modules-load.d/containerd.conf
+    - modprobe:
+        name: overlay
+        state: present
+    - modprobe:
+        name: br_netfilter
+        state: present
+
+- name: Create 99-kubernetes-cri.conf file and reload sysctl
+  hosts: all
+  become: yes
+  tasks:
+    - copy:
+        src: ~/ansible/k8s/99-kubernetes-cri.conf
+        dest: /etc/sysctl.d/99-kubernetes-cri.conf
+      register: k8scri
+    - shell: sysctl --system
+      when: k8scri.changed
+
+- name: Install containerd package to latest version
+  hosts: all
+  become: yes
+  tasks:
+    - ansible.builtin.apt:
+        name: containerd
+        state: latest
+        update_cache: yes
+
+- name: Configure default containerd config file and enable configuration
+  hosts: all
+  become: yes
+  tasks:
+    - ansible.builtin.file:
+        path: /etc/containerd
+        state: directory
+        mode: '0755'
+    - ansible.builtin.shell: |
+        containerd config default > tee /etc/containerd/config.toml
+      register: contdcfg
+    - systemd:
+        name: containerd
+        state: reloaded
+        when: contdcfg.changed
+
+- name: Disable swap
+  hosts: all
+  become: yes
+  tasks:
+    - shell: swapoff -a
+    - shell: sed -i '/ swap / s/^\(.*\)$/#\1/g' /etc/fstab
+
+- name: Install additional packages apt-transport-https and curl
+  hosts: all
+  become: yes
+  tasks:
+    - ansible.builtin.apt:
+        name: apt-transport-https
+        state: latest
+        update_cache: yes
+    - ansible.builtin.apt:
+        name: curl
+        state: latest
+
+- name: Add Kubernetes GPG Key
+  hosts: all
+  become: yes
+  tasks:
+    - ansible.builtin.apt_key:
+        url: https://packages.cloud.google.com/apt/doc/apt-key.gpg
+        state: present
+
+- name: Add kubernetes repository
+  hosts: all
+  become: yes
+  tasks:
+    - copy:
+        src: ~/ansible/k8s/kubernetes.list
+        dest: /etc/apt/sources.list.d/kubernetes.list
+
+- name: Install kubelet, kubeadm, kubectl
+  hosts: all
+  become: yes
+  tasks:
+    - ansible.builtin.apt:
+        update_cache: yes
+    - ansible.builtin.apt:
+        name: kubelet=1.23.0-00
+        state: present
+    - ansible.builtin.apt:
+        name: kubeadm=1.23.0-00
+        state: present
+    - ansible.builtin.apt:
+        name: kubectl=1.23.0-00
+        state: present
+
+- name: Initialize kubeadm on control node
+  hosts: control
+  become: yes
+  tasks:
+    - shell: kubeadm init --pod-network-cidr 10.10.10.0/24 --kubernetes-version 1.23.0
+    - ansible.builtin.file:
+        path: $HOME/.kube
+        state: directory
+        mode: '0755'
+    - shell: cp -l /etc/kubernetes/admin.conf $HOME/.kube/config
+    - shell: chown $(id -u):$(id -g) $HOME/.kube/config
+
+- name: Install calico CNI
+  hosts: control
+  become: yes
+  tasks:
+    - shell: kubectl apply -f https://docs.projectcalico.org/manifests/calico.yaml
